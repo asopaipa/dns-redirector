@@ -1,0 +1,26 @@
+# docker-compose.yml
+
+services:
+  dns-redirector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dns-redirector
+    volumes:
+      - ./ip_blocks.txt:/app/ip_blocks.txt
+      - ./config.txt:/app/config.txt
+    ports:
+      - "53:53/udp"
+    environment:
+      - DEFAULT_TARGET_IP=199.34.228.49
+      - WORKERS=4
+      - RELOAD_INTERVAL=30s
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - dns_network
+
+networks:
+  dns_network:
+    driver: bridge

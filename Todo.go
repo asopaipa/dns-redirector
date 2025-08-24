@@ -1,0 +1,791 @@
+# codigo Go para un servidor DNS que redirige IPs
+package main
+
+import (
+  "bufio"
+  "flag"
+  "fmt"
+  "log"
+  "math/rand"
+  "net"
+  "os"
+  "os/signal"
+  "strings"
+  "sync"
+  "syscall"
+  "time"
+
+  "github.com/miekg/dns"
+)
+
+// IPBlock representa un bloque de IPs origen que redirige a un conjunto de IPs destino
+type IPBlock struct {
+  Name        string
+  SourceIPs   map[string]bool
+  TargetIPs   []net.IP
+  Description string
+}
+
+// dnsCacheEntry representa una entrada en nuestra caché DNS.
+// Guarda el *dns.Msg completo y la hora de expiración.
+type dnsCacheEntry struct {
+  msg        *dns.Msg
+  expiration time.Time
+}
+
+// dnsCache almacena un map de entradas cacheadas.
+// La clave suele ser "nombre|qtype", por ejemplo "example.com.|1" para A.
+type dnsCache struct {
+  mu    sync.RWMutex
+  store map[string]*dnsCacheEntry
+}
+
+func newDNSCache() *dnsCache {
+  return &dnsCache{
+    store: make(map[string]*dnsCacheEntry),
+  }
+}
+
+// IPRedirector gestiona la redirección de DNS basada en múltiples bloques de IPs
+type IPRedirector struct {
+  blocks          map[string]*IPBlock
+  defaultTargetIP net.IP
+  mutex           sync.RWMutex
+  workerCount     int
+  ipBlocksFile    string
+  lastModified    time.Time
+  reloadInterval  time.Duration
+  configFile      string
+  configLastMod   time.Time
+  stopChan        chan struct{}
+  reloadSignal    chan struct{}
+
+  client    *dns.Client
+  dnsServer *dns.Server
+
+  // Caché DNS
+  cache *dnsCache
+}
+
+// DNSRequest encapsula una solicitud DNS
+type DNSRequest struct {
+  W   dns.ResponseWriter
+  Req *dns.Msg
+}
+
+func NewIPRedirector(ipBlocksFile, configFile string, defaultTargetIP string, workerCount int, reloadInterval time.Duration) (*IPRedirector, error) {
+  redirector := &IPRedirector{
+    blocks:          make(map[string]*IPBlock),
+    defaultTargetIP: net.ParseIP(defaultTargetIP),
+    workerCount:     workerCount,
+    ipBlocksFile:    ipBlocksFile,
+    reloadInterval:  reloadInterval,
+    configFile:      configFile,
+    stopChan:        make(chan struct{}),
+    reloadSignal:    make(chan struct{}, 1),
+    client:          &dns.Client{},
+    cache:           newDNSCache(), // Inicializamos la caché
+  }
+
+  if redirector.defaultTargetIP == nil {
+    return nil, fmt.Errorf("invalid default target IP: %s", defaultTargetIP)
+  }
+
+  // Semilla para números aleatorios (para elegir target IPs de forma aleatoria)
+  rand.Seed(time.Now().UnixNano())
+
+  // Carga inicial de bloques de IPs
+  err := redirector.loadIPBlocksFromFile()
+  if err != nil {
+    return nil, err
+  }
+
+  // Carga inicial de configuración
+  if configFile != "" {
+    if err := redirector.loadConfig(); err != nil {
+      log.Printf("Warning: Could not load config file: %v", err)
+    }
+  }
+
+  // Iniciar la monitorización de cambios en archivo
+  go redirector.watchFiles()
+
+  // Iniciar limpieza periódica de la caché (opcional, 1 minuto)
+  go redirector.startCacheCleaner(1 * time.Minute)
+
+  return redirector, nil
+}
+
+func (r *IPRedirector) loadIPBlocksFromFile() error {
+  fileInfo, err := os.Stat(r.ipBlocksFile)
+  if err != nil {
+    return fmt.Errorf("error accessing IP blocks file: %w", err)
+  }
+
+  // Verificar si el archivo no ha sido modificado desde la última lectura
+  if !fileInfo.ModTime().After(r.lastModified) && !r.lastModified.IsZero() {
+    return nil
+  }
+
+  file, err := os.Open(r.ipBlocksFile)
+  if err != nil {
+    return fmt.Errorf("error opening IP blocks file: %w", err)
+  }
+  defer file.Close()
+
+  newBlocks := make(map[string]*IPBlock)
+  scanner := bufio.NewScanner(file)
+
+  var currentBlock *IPBlock
+
+  for scanner.Scan() {
+    line := strings.TrimSpace(scanner.Text())
+    if line == "" || strings.HasPrefix(line, "#") {
+      continue
+    }
+
+    // Nuevo bloque: [BlockName]
+    if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+      blockName := strings.TrimSpace(strings.Trim(line, "[]"))
+      currentBlock = &IPBlock{
+        Name:      blockName,
+        SourceIPs: make(map[string]bool),
+        TargetIPs: []net.IP{},
+      }
+      newBlocks[blockName] = currentBlock
+      continue
+    }
+
+    // Si no estamos en un bloque, ignorar la línea
+    if currentBlock == nil {
+      continue
+    }
+
+    // description=...
+    if strings.HasPrefix(line, "description=") {
+      currentBlock.Description = strings.TrimSpace(strings.TrimPrefix(line, "description="))
+      continue
+    }
+
+    // target=...
+    if strings.HasPrefix(line, "target=") {
+      targetIP := strings.TrimSpace(strings.TrimPrefix(line, "target="))
+      parsedIP := net.ParseIP(targetIP)
+      if parsedIP == nil {
+        log.Printf("Warning: Invalid target IP format in block %s: %s, skipping", currentBlock.Name, targetIP)
+        continue
+      }
+      currentBlock.TargetIPs = append(currentBlock.TargetIPs, parsedIP)
+      continue
+    }
+
+    // Cualquier otra línea, asumimos que es IP origen
+    parsedIP := net.ParseIP(line)
+    if parsedIP == nil {
+      log.Printf("Warning: Invalid source IP format in block %s: %s, skipping", currentBlock.Name, line)
+      continue
+    }
+    currentBlock.SourceIPs[line] = true
+  }
+
+  if err := scanner.Err(); err != nil {
+    return fmt.Errorf("error reading IP blocks file: %w", err)
+  }
+
+  // Actualizar bloques
+  r.mutex.Lock()
+  r.blocks = newBlocks
+  r.lastModified = fileInfo.ModTime()
+  r.mutex.Unlock()
+
+  log.Printf("Loaded %d IP blocks from %s (modified: %s)", len(newBlocks), r.ipBlocksFile, fileInfo.ModTime().Format(time.RFC3339))
+  for name, block := range newBlocks {
+    log.Printf("  Block '%s': %d source IPs, %d target IPs - %s",
+      name, len(block.SourceIPs), len(block.TargetIPs), block.Description)
+  }
+
+  return nil
+}
+
+func (r *IPRedirector) loadConfig() error {
+  if r.configFile == "" {
+    return nil
+  }
+
+  fileInfo, err := os.Stat(r.configFile)
+  if err != nil {
+    return fmt.Errorf("error accessing config file: %w", err)
+  }
+
+  if !fileInfo.ModTime().After(r.configLastMod) && !r.configLastMod.IsZero() {
+    return nil
+  }
+
+  file, err := os.Open(r.configFile)
+  if err != nil {
+    return fmt.Errorf("error opening config file: %w", err)
+  }
+  defer file.Close()
+
+  config := make(map[string]string)
+  scanner := bufio.NewScanner(file)
+  for scanner.Scan() {
+    line := strings.TrimSpace(scanner.Text())
+    if line == "" || strings.HasPrefix(line, "#") {
+      continue
+    }
+
+    parts := strings.SplitN(line, "=", 2)
+    if len(parts) != 2 {
+      continue
+    }
+
+    key := strings.TrimSpace(parts[0])
+    value := strings.TrimSpace(parts[1])
+    config[key] = value
+  }
+
+  if err := scanner.Err(); err != nil {
+    return fmt.Errorf("error reading config file: %w", err)
+  }
+
+  // Comprobar cambios en la IP destino por defecto
+  if newDefaultTargetIP, ok := config["DEFAULT_TARGET_IP"]; ok {
+    parsedIP := net.ParseIP(newDefaultTargetIP)
+    if parsedIP == nil {
+      log.Printf("Warning: Invalid default target IP in config: %s, ignoring", newDefaultTargetIP)
+    } else {
+      r.mutex.Lock()
+      oldIP := r.defaultTargetIP.String()
+      r.defaultTargetIP = parsedIP
+      r.mutex.Unlock()
+      log.Printf("Default target IP changed from %s to %s", oldIP, newDefaultTargetIP)
+    }
+  }
+
+  r.configLastMod = fileInfo.ModTime()
+  log.Printf("Loaded configuration from %s (modified: %s)", r.configFile, fileInfo.ModTime().Format(time.RFC3339))
+  return nil
+}
+
+func (r *IPRedirector) watchFiles() {
+  ticker := time.NewTicker(r.reloadInterval)
+  defer ticker.Stop()
+
+  for {
+    select {
+    case <-ticker.C:
+      if err := r.loadIPBlocksFromFile(); err != nil {
+        log.Printf("Error reloading IP blocks: %v", err)
+      }
+      if err := r.loadConfig(); err != nil {
+        log.Printf("Error reloading config: %v", err)
+      }
+    case <-r.reloadSignal:
+      if err := r.loadIPBlocksFromFile(); err != nil {
+        log.Printf("Error reloading IP blocks: %v", err)
+      }
+      if err := r.loadConfig(); err != nil {
+        log.Printf("Error reloading config: %v", err)
+      }
+    case <-r.stopChan:
+      return
+    }
+  }
+}
+
+func (r *IPRedirector) TriggerReload() {
+  select {
+  case r.reloadSignal <- struct{}{}:
+  default:
+  }
+}
+
+func (r *IPRedirector) Stop() {
+  close(r.stopChan)
+  if r.dnsServer != nil {
+    if err := r.dnsServer.Shutdown(); err != nil {
+      log.Printf("Error shutting down DNS server: %v", err)
+    }
+  }
+}
+
+// Método para obtener una IP destino en función de la IP devuelta por upstream
+func (r *IPRedirector) getRedirectIP(sourceIP string) (net.IP, string, bool) {
+  r.mutex.RLock()
+  defer r.mutex.RUnlock()
+
+  for blockName, block := range r.blocks {
+    if _, found := block.SourceIPs[sourceIP]; found {
+      if len(block.TargetIPs) > 0 {
+        randomIdx := rand.Intn(len(block.TargetIPs))
+        return block.TargetIPs[randomIdx], blockName, true
+      }
+      // Si no hay IPs destino en ese bloque, usar la default
+      return r.defaultTargetIP, blockName, true
+    }
+  }
+
+  // Si no hay ningún bloque que coincida
+  return r.defaultTargetIP, "default", false
+}
+
+// handleDNSRequest con uso de caché
+func (r *IPRedirector) handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
+  msg := new(dns.Msg)
+  msg.SetReply(req)
+  // Normalmente, para un forwarder, no somos autoritativos
+  msg.Authoritative = false
+
+  var allAnswers []dns.RR
+
+  for _, q := range req.Question {
+    // 1. Generar una clave de caché según nombre y tipo
+    cacheKey := fmt.Sprintf("%s|%d", q.Name, q.Qtype)
+
+    // 2. Intentar buscar en caché
+    cachedResp := r.lookupCache(cacheKey)
+    if cachedResp != nil {
+      // Añadir todos los RR de la respuesta cacheada
+      allAnswers = append(allAnswers, cachedResp.Answer...)
+      continue
+    }
+
+    // 3. Cache miss -> consultar al upstream (8.8.8.8)
+    questionMsg := new(dns.Msg)
+    questionMsg.SetQuestion(q.Name, q.Qtype)
+    log.Printf("Query for %s (cache miss)", q.Name)
+
+    resp, _, err := r.client.Exchange(questionMsg, "8.8.8.8:53")
+    if err != nil {
+      log.Printf("Error querying upstream DNS for %s: %v", q.Name, err)
+      msg.Rcode = dns.RcodeServerFailure
+      _ = w.WriteMsg(msg)
+      return
+    }
+
+    // 4. Reescribir registros A si corresponde
+    for _, ans := range resp.Answer {
+      if a, ok := ans.(*dns.A); ok {
+        ipStr := a.A.String()
+        targetIP, blockName, found := r.getRedirectIP(ipStr)
+        if found {
+          log.Printf("Redirecting %s from %s to %s (block: %s)",
+            q.Name, ipStr, targetIP.String(), blockName)
+          a.A = targetIP
+        }
+      }
+      allAnswers = append(allAnswers, ans)
+    }
+
+    // 5. Guardar en caché la respuesta
+    r.saveCache(cacheKey, resp)
+  }
+
+  msg.Answer = allAnswers
+  _ = w.WriteMsg(msg)
+}
+
+// startDNSServer inicia el servidor DNS en UDP y lanza un pool de workers
+func (r *IPRedirector) startDNSServer(address string) error {
+  requestChan := make(chan DNSRequest, 1000)
+
+  // Registrar el handler que reenvía al canal
+  dns.HandleFunc(".", func(w dns.ResponseWriter, req *dns.Msg) {
+    requestChan <- DNSRequest{W: w, Req: req}
+  })
+
+  server := &dns.Server{
+    Addr:    address,
+    Net:     "udp",
+    Handler: dns.DefaultServeMux,
+  }
+  r.dnsServer = server
+
+  go func() {
+    if err := server.ListenAndServe(); err != nil {
+      log.Fatalf("Failed to start DNS server: %v", err)
+    }
+  }()
+  log.Printf("DNS server started on %s with %d worker threads", address, r.workerCount)
+
+  var wg sync.WaitGroup
+  wg.Add(r.workerCount)
+
+  for i := 0; i < r.workerCount; i++ {
+    go func(id int) {
+      defer wg.Done()
+      log.Printf("Starting DNS worker %d", id)
+
+      for request := range requestChan {
+        r.handleDNSRequest(request.W, request.Req)
+      }
+    }(i)
+  }
+
+  wg.Wait()
+  return nil
+}
+
+// lookupCache busca si hay una entrada válida en caché
+func (r *IPRedirector) lookupCache(key string) *dns.Msg {
+  r.cache.mu.RLock()
+  defer r.cache.mu.RUnlock()
+
+  entry, found := r.cache.store[key]
+  if !found {
+    return nil
+  }
+  if time.Now().After(entry.expiration) {
+    // Está expirada, la consideramos inválida (no la borramos aquí, se borrará en cleanExpiredEntries)
+    return nil
+  }
+  return entry.msg
+}
+
+// saveCache guarda la respuesta DNS en caché, calculando la expiración a partir del TTL.
+func (r *IPRedirector) saveCache(key string, resp *dns.Msg) {
+  // Establecemos un TTL mínimo por defecto (ej: 3600s)
+  var minTTL uint32 = 3600
+
+  for _, ans := range resp.Answer {
+    switch rr := ans.(type) {
+    case *dns.A:
+      if rr.Hdr.Ttl < minTTL {
+        minTTL = rr.Hdr.Ttl
+      }
+    case *dns.AAAA:
+      if rr.Hdr.Ttl < minTTL {
+        minTTL = rr.Hdr.Ttl
+      }
+    // Añadir otros tipos de RR si quieres
+    }
+  }
+
+  expiration := time.Now().Add(time.Duration(minTTL) * time.Second)
+
+  r.cache.mu.Lock()
+  r.cache.store[key] = &dnsCacheEntry{
+    msg:        resp,
+    expiration: expiration,
+  }
+  r.cache.mu.Unlock()
+}
+
+// startCacheCleaner lanza una goroutine que limpia las entradas expiradas cada cierto intervalo.
+func (r *IPRedirector) startCacheCleaner(interval time.Duration) {
+  ticker := time.NewTicker(interval)
+  go func() {
+    for {
+      select {
+      case <-ticker.C:
+        r.cleanExpiredEntries()
+      case <-r.stopChan:
+        ticker.Stop()
+        return
+      }
+    }
+  }()
+}
+
+// cleanExpiredEntries elimina del map las entradas cuyo TTL ya expiró
+func (r *IPRedirector) cleanExpiredEntries() {
+  now := time.Now()
+  r.cache.mu.Lock()
+  defer r.cache.mu.Unlock()
+
+  for key, entry := range r.cache.store {
+    if now.After(entry.expiration) {
+      delete(r.cache.store, key)
+    }
+  }
+}
+
+// MAIN
+func main() {
+  ipBlocksFile := flag.String("ip-blocks", "ip_blocks.txt", "File containing IP blocks configuration")
+  defaultTargetIP := flag.String("default-target-ip", "199.34.228.49", "Default IP to redirect to if no block matches")
+  listenAddr := flag.String("listen", ":53", "Address to listen on (IP:port)")
+  workerCount := flag.Int("workers", 4, "Number of worker threads")
+  reloadInterval := flag.Duration("reload-interval", 30*time.Second, "Interval to check for file changes (e.g., 30s, 1m)")
+  configFile := flag.String("config", "config.txt", "Configuration file path")
+  flag.Parse()
+
+  redirector, err := NewIPRedirector(*ipBlocksFile, *configFile, *defaultTargetIP, *workerCount, *reloadInterval)
+  if err != nil {
+    log.Fatalf("Error initializing redirector: %v", err)
+  }
+  defer redirector.Stop()
+
+  // Manejo de señales
+  sigChan := make(chan os.Signal, 1)
+  signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+  // Iniciar servidor DNS
+  go redirector.startDNSServer(*listenAddr)
+
+  // Esperar señales
+  for sig := range sigChan {
+    if sig == syscall.SIGHUP {
+      log.Println("Received SIGHUP, reloading configuration")
+      redirector.TriggerReload()
+    } else {
+      log.Printf("Received signal %v, shutting down", sig)
+      break
+    }
+  }
+}
+
+
+# config.txt  
+
+# Configuración para DNS Redirector
+# Última actualización: Mon Apr  7 18:08:21 UTC 2025
+DEFAULT_TARGET_IP=199.34.228.49
+
+
+go.mod
+
+module dns-redirector
+
+go 1.21
+
+require github.com/miekg/dns v1.1.58
+
+require (
+  golang.org/x/mod v0.14.0 // indirect
+  golang.org/x/net v0.22.0 // indirect
+  golang.org/x/sys v0.17.0 // indirect
+  golang.org/x/tools v0.17.0 // indirect
+)
+
+
+# Dockerfile
+
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /build
+
+# Install git and dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy source code files
+COPY *.go ./
+COPY go.mod ./
+
+# Initialize module and get dependencies explicitly
+RUN go mod tidy
+RUN go mod download
+RUN go get github.com/miekg/dns@v1.1.58
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -o dns-redirector
+
+# Create a minimal runtime image
+FROM alpine:3.18
+
+WORKDIR /app
+
+# Install certificates for HTTPS requests if needed
+RUN apk add --no-cache ca-certificates
+
+# Copy the binary from the builder stage
+COPY --from=builder /build/dns-redirector /app/
+
+# Create necessary directories
+RUN mkdir -p /app/data
+
+# Copy configuration files
+COPY ip_blocks.txt /app/ip_blocks.txt
+COPY config.txt /app/config.txt
+
+# Set up entrypoint script
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+# Health check to verify DNS server is running
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD nc -uz 127.0.0.1 53 || exit 1
+
+# Expose DNS port
+EXPOSE 53/udp
+
+# Set signal handling mode to ensure proper shutdown
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+
+docker-compose.yml
+
+services:
+  dns-redirector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dns-redirector
+    volumes:
+      - ./ip_blocks.txt:/app/ip_blocks.txt
+      - ./config.txt:/app/config.txt
+    ports:
+      - "53:53/udp"
+    environment:
+      - DEFAULT_TARGET_IP=199.34.228.49
+      - WORKERS=4
+      - RELOAD_INTERVAL=30s
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - dns_network
+
+networks:
+  dns_network:
+    driver: bridge
+
+
+entrypoint.sh
+
+#!/bin/sh
+
+# Set default values if environment variables are not provided
+DEFAULT_TARGET_IP=${DEFAULT_TARGET_IP:-199.34.228.49}
+WORKERS=${WORKERS:-4}
+IP_BLOCKS_FILE=${IP_BLOCKS_FILE:-/app/ip_blocks.txt}
+LISTEN_ADDR=${LISTEN_ADDR:-:53}
+RELOAD_INTERVAL=${RELOAD_INTERVAL:-30s}
+CONFIG_FILE=${CONFIG_FILE:-/app/config.txt}
+
+# Update config.txt with the environment variable value if provided
+if [ -n "$DEFAULT_TARGET_IP" ]; then
+  echo "# Configuración para DNS Redirector" > $CONFIG_FILE
+  echo "# Última actualización: $(date)" >> $CONFIG_FILE
+  echo "DEFAULT_TARGET_IP=$DEFAULT_TARGET_IP" >> $CONFIG_FILE
+  echo "Config file updated with DEFAULT_TARGET_IP=$DEFAULT_TARGET_IP"
+fi
+
+echo "Starting DNS Redirector with the following configuration:"
+echo "IP Blocks File: $IP_BLOCKS_FILE"
+echo "Config File: $CONFIG_FILE"
+echo "Initial Default Target IP: $DEFAULT_TARGET_IP"
+echo "Listen Address: $LISTEN_ADDR"
+echo "Worker Threads: $WORKERS"
+echo "Reload Interval: $RELOAD_INTERVAL"
+
+# Execute the DNS redirector with the configured parameters
+exec /app/dns-redirector \
+  -ip-blocks="${IP_BLOCKS_FILE}" \
+  -default-target-ip="${DEFAULT_TARGET_IP}" \
+  -listen="${LISTEN_ADDR}" \
+  -workers="${WORKERS}" \
+  -reload-interval="${RELOAD_INTERVAL}" \
+  -config="${CONFIG_FILE}"
+
+
+# DNS IP Redirector con Bloques Configurables
+
+Este proyecto implementa un servicio DNS que intercepta respuestas que contienen ciertas direcciones IP y las redirecciona a IPs destino configurables, con soporte para bloques de IPs con redirección aleatoria.
+
+## Características
+
+- Redirección de bloques de IPs a grupos de IPs destino configurable
+- Selección aleatoria de IP destino dentro de cada bloque para balancear carga
+- Procesamiento eficiente con múltiples hilos
+- Fácil despliegue usando Docker y Docker Compose
+- Configuración mediante archivos y variables de entorno
+- Recarga dinámica de configuración sin reiniciar el servicio
+
+## Estructura del Proyecto
+
+
+.
+├── dns-redirector.go    # Código principal en Go
+├── Dockerfile           # Instrucciones para construir la imagen Docker
+├── docker-compose.yml   # Configuración de Docker Compose
+├── entrypoint.sh        # Script de inicio para el contenedor
+├── go.mod               # Dependencias de Go
+├── go.sum               # Verificación de dependencias
+├── ip_blocks.txt        # Configuración de bloques de IPs
+├── config.txt           # Configuración general
+└── README.md            # Este archivo
+
+
+## Requisitos
+
+- Docker
+- Docker Compose
+
+## Configuración de Bloques de IPs
+
+El archivo `ip_blocks.txt` permite definir bloques de IPs origen y destino. Cada bloque tiene el siguiente formato:
+
+
+[nombre_bloque]
+description=Descripción del bloque
+target=IP destino 1
+target=IP destino 2
+IP origen 1
+IP origen 2
+...
+
+
+- Cada bloque comienza con un nombre entre corchetes `[nombre]`
+- Líneas con `description=` definen una descripción para el bloque
+- Líneas con `target=` definen las IPs destino para ese bloque
+- Las IPs origen se listan directamente (una por línea)
+- Cuando se detecta una IP origen, se redirige a una IP destino aleatoria de ese bloque
+
+## Configuración General
+
+Puedes configurar el servicio mediante las siguientes variables de entorno en el `docker-compose.yml`:
+
+- `DEFAULT_TARGET_IP`: La IP destino por defecto (por defecto: 199.34.228.49)
+- `WORKERS`: Número de hilos trabajadores (por defecto: 4)
+- `IP_BLOCKS_FILE`: Ruta al archivo de bloques de IPs (por defecto: /app/ip_blocks.txt)
+- `LISTEN_ADDR`: Dirección y puerto de escucha (por defecto: :53)
+- `RELOAD_INTERVAL`: Intervalo para comprobar cambios en los archivos (por defecto: 30s)
+- `CONFIG_FILE`: Ruta al archivo de configuración (por defecto: /app/config.txt)
+
+### Recarga dinámica
+
+El sistema soporta recarga dinámica de:
+
+1. **Bloques de IPs**: Puedes modificar el archivo `ip_blocks.txt` en cualquier momento y los cambios se detectarán automáticamente según el intervalo de recarga configurado.
+
+2. **IP destino por defecto**: Puedes cambiar la IP destino por defecto de dos formas:
+   - Editando directamente el archivo `config.txt` y cambiando el valor de `DEFAULT_TARGET_IP`
+   - Reiniciando el contenedor con una nueva variable de entorno DEFAULT_TARGET_IP
+
+Los cambios se aplican sin necesidad de reiniciar el servicio DNS.
+
+## Uso
+
+1. Edita el archivo `ip_list.txt` con las IPs que deseas redireccionar.
+2. Inicia el servicio:
+
+bash
+docker-compose up -d
+
+
+3. Para detener el servicio:
+
+bash
+docker-compose down
+
+
+4. Configura tus dispositivos para usar la IP del host donde se ejecuta el contenedor como servidor DNS.
+
+## Monitoreo de Logs
+
+bash
+docker-compose logs -f
+
+
+## Notas de Seguridad
+
+- El contenedor requiere privilegios de red para operar en el puerto 53 (UDP).
+- Se recomienda configurar un firewall adecuado en el servidor host.
+- Esta herramienta debe usarse en entornos controlados y con fines legítimos.
+
+
+†****†

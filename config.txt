@@ -1,0 +1,21 @@
+# config.txt  
+
+# Configuración para DNS Redirector
+# Última actualización: Mon Apr  7 18:08:21 UTC 2025
+DEFAULT_TARGET_IP=199.34.228.49
+
+
+go.mod
+
+module dns-redirector
+
+go 1.21
+
+require github.com/miekg/dns v1.1.58
+
+require (
+  golang.org/x/mod v0.14.0 // indirect
+  golang.org/x/net v0.22.0 // indirect
+  golang.org/x/sys v0.17.0 // indirect
+  golang.org/x/tools v0.17.0 // indirect
+)
