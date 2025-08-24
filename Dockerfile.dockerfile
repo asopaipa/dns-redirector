@@ -9,7 +9,7 @@ RUN apk add --no-cache git gcc musl-dev
 
 # Copy source code files
 COPY *.go ./
-COPY go.mod ./
+#COPY go.mod ./
 
 # Initialize module and get dependencies explicitly
 RUN go mod tidy
@@ -52,3 +52,4 @@ EXPOSE 53/udp
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
