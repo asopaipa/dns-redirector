@@ -23,9 +23,9 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/borrame:latest
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/dns-redirector:latest
           file: ./Dockerfile.dockerfile
           # Opcional: si tu servicio no se llama 'app' en docker-compose.yml,
           # descomenta y ajusta la siguiente línea.
-          # build-args: |
-          #   SERVICE_NAME=nombre-de-tu-servicio
+          build-args: |
+            SERVICE_NAME=dns-redirector
