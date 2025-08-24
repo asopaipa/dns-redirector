@@ -24,6 +24,7 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/borrame:latest
+          file: ./Dockerfile.dockerfile
           # Opcional: si tu servicio no se llama 'app' en docker-compose.yml,
           # descomenta y ajusta la siguiente línea.
           # build-args: |
