@@ -45,4 +45,3 @@ exec /app/dns-redirector \
   -upstream-dot "1.1.1.1:853"
 
   -config="${CONFIG_FILE}"
-
