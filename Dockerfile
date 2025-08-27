@@ -48,11 +48,14 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 # Expose DNS port
 EXPOSE 53/udp
 EXPOSE 53/tcp
+EXPOSE 853/udp
+EXPOSE 853/tcp
 
 # Set signal handling mode to ensure proper shutdown
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
 
 
 
