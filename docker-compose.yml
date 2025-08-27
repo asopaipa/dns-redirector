@@ -11,6 +11,7 @@ services:
       - ./config.txt:/app/config.txt
     ports:
       - "53:53/udp"
+      - "53:53/tcp"
     environment:
       - DEFAULT_TARGET_IP=199.34.228.49
       - WORKERS=4
@@ -23,4 +24,5 @@ services:
 
 networks:
   dns_network:
+
     driver: bridge
