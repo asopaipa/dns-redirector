@@ -7,6 +7,8 @@ IP_BLOCKS_FILE=${IP_BLOCKS_FILE:-/app/ip_blocks.txt}
 LISTEN_ADDR=${LISTEN_ADDR:-:53}
 RELOAD_INTERVAL=${RELOAD_INTERVAL:-30s}
 CONFIG_FILE=${CONFIG_FILE:-/app/config.txt}
+DOT_CERT=${DOT_CERT:-/etc/letsencrypt/live/digi-dns.duckdns.org/fullchain.pem}
+DOT_KEY=${DOT_KEY:-/etc/letsencrypt/live/digi-dns.duckdns.org/privkey.pem}
 
 # Update config.txt with the environment variable value if provided
 if [ -n "$DEFAULT_TARGET_IP" ]; then
@@ -24,6 +26,10 @@ echo "Listen Address: $LISTEN_ADDR"
 echo "Worker Threads: $WORKERS"
 echo "Reload Interval: $RELOAD_INTERVAL"
 
+echo "DoT Cert: $DOT_CERT"
+echo "DoT Key: $DOT_KEY"
+
+
 # Execute the DNS redirector with the configured parameters
 exec /app/dns-redirector \
   -ip-blocks="${IP_BLOCKS_FILE}" \
@@ -32,4 +38,11 @@ exec /app/dns-redirector \
   -workers="${WORKERS}" \
   -reload-interval="${RELOAD_INTERVAL}" \
 
+  -enable-dot \
+  -dot-cert="${DOT_CERT}" \
+  -dot-key="${DOT_KEY}" \
+  -dot-listen ":853" \
+  -upstream-dot "1.1.1.1:853"
+
   -config="${CONFIG_FILE}"
+
