@@ -31,4 +31,5 @@ exec /app/dns-redirector \
   -listen="${LISTEN_ADDR}" \
   -workers="${WORKERS}" \
   -reload-interval="${RELOAD_INTERVAL}" \
+
   -config="${CONFIG_FILE}"
