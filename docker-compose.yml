@@ -12,6 +12,8 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
+      - "853:853/udp"
+      - "853:853/tcp"
     environment:
       - DEFAULT_TARGET_IP=199.34.228.49
       - WORKERS=4
@@ -26,3 +28,4 @@ networks:
   dns_network:
 
     driver: bridge
+
