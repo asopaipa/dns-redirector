@@ -1,8 +1,9 @@
-// Codigo Go para un servidor DNS que redirige IPs
+// Codigo Go para un servidor DNS que redirige IPs con soporte DoT
 package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -60,11 +61,21 @@ type IPRedirector struct {
 	stopChan        chan struct{}
 	reloadSignal    chan struct{}
 
-	client    *dns.Client
-	dnsServer *dns.Server
+	client       *dns.Client
+	clientDoT    *dns.Client  // Cliente para DoT upstream
+	dnsServer    *dns.Server
+	dnsServerTCP *dns.Server
+	dnsServerDoT *dns.Server  // Servidor DoT
 
 	// Caché DNS
 	cache *dnsCache
+	
+	// Configuración DoT
+	enableDoT      bool
+	dotCertFile    string
+	dotKeyFile     string
+	dotListenAddr  string
+	upstreamDoT    string  // Servidor DoT upstream (ej: "1.1.1.1:853")
 }
 
 // DNSRequest encapsula una solicitud DNS
@@ -73,7 +84,7 @@ type DNSRequest struct {
 	Req *dns.Msg
 }
 
-func NewIPRedirector(ipBlocksFile, configFile string, defaultTargetIP string, workerCount int, reloadInterval time.Duration) (*IPRedirector, error) {
+func NewIPRedirector(ipBlocksFile, configFile string, defaultTargetIP string, workerCount int, reloadInterval time.Duration, enableDoT bool, dotCertFile, dotKeyFile, dotListenAddr, upstreamDoT string) (*IPRedirector, error) {
 	redirector := &IPRedirector{
 		blocks:          make(map[string]*IPBlock),
 		defaultTargetIP: net.ParseIP(defaultTargetIP),
@@ -84,11 +95,27 @@ func NewIPRedirector(ipBlocksFile, configFile string, defaultTargetIP string, wo
 		stopChan:        make(chan struct{}),
 		reloadSignal:    make(chan struct{}, 1),
 		client:          &dns.Client{},
-		cache:           newDNSCache(), // Inicializamos la caché
+		cache:           newDNSCache(),
+		enableDoT:       enableDoT,
+		dotCertFile:     dotCertFile,
+		dotKeyFile:      dotKeyFile,
+		dotListenAddr:   dotListenAddr,
+		upstreamDoT:     upstreamDoT,
 	}
 
 	if redirector.defaultTargetIP == nil {
 		return nil, fmt.Errorf("invalid default target IP: %s", defaultTargetIP)
+	}
+
+	// Configurar cliente DoT si está habilitado
+	if enableDoT && upstreamDoT != "" {
+		redirector.clientDoT = &dns.Client{
+			Net: "tcp-tls",
+			TLSConfig: &tls.Config{
+				ServerName: strings.Split(upstreamDoT, ":")[0], // Extraer hostname para SNI
+			},
+		}
+		log.Printf("DoT client configured for upstream: %s", upstreamDoT)
 	}
 
 	// Semilla para números aleatorios (para elegir target IPs de forma aleatoria)
@@ -263,6 +290,22 @@ func (r *IPRedirector) loadConfig() error {
 		}
 	}
 
+	// Cargar configuración DoT desde archivo de config
+	if upstreamDoT, ok := config["UPSTREAM_DOT"]; ok {
+		r.mutex.Lock()
+		r.upstreamDoT = upstreamDoT
+		if r.enableDoT {
+			r.clientDoT = &dns.Client{
+				Net: "tcp-tls",
+				TLSConfig: &tls.Config{
+					ServerName: strings.Split(upstreamDoT, ":")[0],
+				},
+			}
+		}
+		r.mutex.Unlock()
+		log.Printf("DoT upstream server updated to: %s", upstreamDoT)
+	}
+
 	r.configLastMod = fileInfo.ModTime()
 	log.Printf("Loaded configuration from %s (modified: %s)", r.configFile, fileInfo.ModTime().Format(time.RFC3339))
 	return nil
@@ -308,6 +351,16 @@ func (r *IPRedirector) Stop() {
 			log.Printf("Error shutting down DNS server: %v", err)
 		}
 	}
+	if r.dnsServerTCP != nil {
+		if err := r.dnsServerTCP.Shutdown(); err != nil {
+			log.Printf("Error shutting down DNS TCP server: %v", err)
+		}
+	}
+	if r.dnsServerDoT != nil {
+		if err := r.dnsServerDoT.Shutdown(); err != nil {
+			log.Printf("Error shutting down DoT server: %v", err)
+		}
+	}
 }
 
 // Método para obtener una IP destino en función de la IP devuelta por upstream
@@ -330,7 +383,7 @@ func (r *IPRedirector) getRedirectIP(sourceIP string) (net.IP, string, bool) {
 	return r.defaultTargetIP, "default", false
 }
 
-// handleDNSRequest con uso de caché
+// handleDNSRequest con uso de caché y soporte DoT
 func (r *IPRedirector) handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 	msg := new(dns.Msg)
 	msg.SetReply(req)
@@ -351,12 +404,28 @@ func (r *IPRedirector) handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 
-		// 3. Cache miss -> consultar al upstream (8.8.8.8)
+		// 3. Cache miss -> consultar al upstream
 		questionMsg := new(dns.Msg)
 		questionMsg.SetQuestion(q.Name, q.Qtype)
 		log.Printf("Query for %s (cache miss)", q.Name)
 
-		resp, _, err := r.client.Exchange(questionMsg, "8.8.8.8:53")
+		var resp *dns.Msg
+		var err error
+
+		// Decidir si usar DoT o DNS normal para upstream
+		if r.enableDoT && r.clientDoT != nil && r.upstreamDoT != "" {
+			// Usar DoT para consultar upstream
+			resp, _, err = r.clientDoT.Exchange(questionMsg, r.upstreamDoT)
+			if err != nil {
+				log.Printf("Error querying upstream DoT DNS for %s: %v, falling back to regular DNS", q.Name, err)
+				// Fallback a DNS normal si DoT falla
+				resp, _, err = r.client.Exchange(questionMsg, "8.8.8.8:53")
+			}
+		} else {
+			// Usar DNS normal
+			resp, _, err = r.client.Exchange(questionMsg, "8.8.8.8:53")
+		}
+
 		if err != nil {
 			log.Printf("Error querying upstream DNS for %s: %v", q.Name, err)
 			msg.Rcode = dns.RcodeServerFailure
@@ -386,7 +455,7 @@ func (r *IPRedirector) handleDNSRequest(w dns.ResponseWriter, req *dns.Msg) {
 	_ = w.WriteMsg(msg)
 }
 
-// startDNSServer inicia el servidor DNS en UDP y lanza un pool de workers
+// startDNSServer inicia los servidores DNS (UDP, TCP y DoT si está habilitado)
 func (r *IPRedirector) startDNSServer(address string) error {
 	requestChan := make(chan DNSRequest, 1000)
 
@@ -395,19 +464,65 @@ func (r *IPRedirector) startDNSServer(address string) error {
 		requestChan <- DNSRequest{W: w, Req: req}
 	})
 
-	server := &dns.Server{
+	// Servidor UDP
+	serverUDP := &dns.Server{
 		Addr:    address,
 		Net:     "udp",
 		Handler: dns.DefaultServeMux,
 	}
-	r.dnsServer = server
+	r.dnsServer = serverUDP
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start DNS server: %v", err)
+		if err := serverUDP.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start DNS UDP server: %v", err)
 		}
 	}()
-	log.Printf("DNS server started on %s with %d worker threads", address, r.workerCount)
+	log.Printf("DNS UDP server started on %s", address)
+
+	// Servidor TCP
+	serverTCP := &dns.Server{
+		Addr:    address,
+		Net:     "tcp",
+		Handler: dns.DefaultServeMux,
+	}
+	r.dnsServerTCP = serverTCP
+
+	go func() {
+		if err := serverTCP.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start DNS TCP server: %v", err)
+		}
+	}()
+	log.Printf("DNS TCP server started on %s", address)
+
+	// Servidor DoT si está habilitado
+	if r.enableDoT && r.dotCertFile != "" && r.dotKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(r.dotCertFile, r.dotKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to load TLS certificates: %v", err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+
+		serverDoT := &dns.Server{
+			Addr:      r.dotListenAddr,
+			Net:       "tcp-tls",
+			Handler:   dns.DefaultServeMux,
+			TLSConfig: tlsConfig,
+		}
+		r.dnsServerDoT = serverDoT
+
+		go func() {
+			if err := serverDoT.ListenAndServe(); err != nil {
+				log.Fatalf("Failed to start DoT server: %v", err)
+			}
+		}()
+		log.Printf("DoT server started on %s", r.dotListenAddr)
+	}
+
+	log.Printf("All DNS servers started with %d worker threads", r.workerCount)
 
 	var wg sync.WaitGroup
 	wg.Add(r.workerCount)
@@ -509,9 +624,37 @@ func main() {
 	workerCount := flag.Int("workers", 4, "Number of worker threads")
 	reloadInterval := flag.Duration("reload-interval", 30*time.Second, "Interval to check for file changes (e.g., 30s, 1m)")
 	configFile := flag.String("config", "config.txt", "Configuration file path")
+	
+	// Nuevos flags para DoT
+	enableDoT := flag.Bool("enable-dot", false, "Enable DNS over TLS (DoT)")
+	dotListenAddr := flag.String("dot-listen", ":853", "DoT listen address (IP:port)")
+	dotCertFile := flag.String("dot-cert", "", "Path to TLS certificate file for DoT")
+	dotKeyFile := flag.String("dot-key", "", "Path to TLS private key file for DoT")
+	upstreamDoT := flag.String("upstream-dot", "1.1.1.1:853", "Upstream DoT server (host:port)")
+	
 	flag.Parse()
 
-	redirector, err := NewIPRedirector(*ipBlocksFile, *configFile, *defaultTargetIP, *workerCount, *reloadInterval)
+	// Validar parámetros DoT si está habilitado
+	if *enableDoT {
+		if *dotCertFile == "" || *dotKeyFile == "" {
+			log.Println("Warning: DoT is enabled but certificate files are not provided.")
+			log.Println("To enable DoT server, please provide -dot-cert and -dot-key flags.")
+			log.Println("DoT will only be used for upstream queries.")
+		}
+	}
+
+	redirector, err := NewIPRedirector(
+		*ipBlocksFile, 
+		*configFile, 
+		*defaultTargetIP, 
+		*workerCount, 
+		*reloadInterval,
+		*enableDoT,
+		*dotCertFile,
+		*dotKeyFile,
+		*dotListenAddr,
+		*upstreamDoT,
+	)
 	if err != nil {
 		log.Fatalf("Error initializing redirector: %v", err)
 	}
