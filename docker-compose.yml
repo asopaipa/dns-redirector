@@ -18,6 +18,8 @@ services:
       - DEFAULT_TARGET_IP=199.34.228.49
       - WORKERS=4
       - RELOAD_INTERVAL=30s
+      - DOT_CERT=/etc/letsencrypt/live/digi-dns.duckdns.org/fullchain.pem
+      - DOT_KEY=/etc/letsencrypt/live/digi-dns.duckdns.org/privkey.pem
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
@@ -28,4 +30,5 @@ networks:
   dns_network:
 
     driver: bridge
+
 
