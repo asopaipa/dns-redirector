@@ -494,10 +494,15 @@ func (r *IPRedirector) startDNSServer(address string) error {
 	}()
 	log.Printf("DNS TCP server started on %s", address)
 
+	log.Printf("DEBUG: Enabled ", r.enableDoT)
+	log.Printf("DEBUG: cert ", r.dotCertFile)
+	log.Printf("DEBUG: key ", r.dotKeyFile)
+
 	// Servidor DoT si está habilitado
 	if r.enableDoT && r.dotCertFile != "" && r.dotKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(r.dotCertFile, r.dotKeyFile)
 		if err != nil {
+			log.Printf("ERROR: failed to load TLS certificates: %v", err)
 			return fmt.Errorf("failed to load TLS certificates: %v", err)
 		}
 
@@ -516,6 +521,7 @@ func (r *IPRedirector) startDNSServer(address string) error {
 
 		go func() {
 			if err := serverDoT.ListenAndServe(); err != nil {
+				log.Printf("ERROR: Failed to start DoT server: %v", err)
 				log.Fatalf("Failed to start DoT server: %v", err)
 			}
 		}()
@@ -680,3 +686,4 @@ func main() {
 }
 
 // Fin del código
+
