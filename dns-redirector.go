@@ -494,10 +494,6 @@ func (r *IPRedirector) startDNSServer(address string) error {
 	}()
 	log.Printf("DNS TCP server started on %s", address)
 
-	log.Printf("DEBUG: Enabled ", r.enableDoT)
-	log.Printf("DEBUG: cert ", r.dotCertFile)
-	log.Printf("DEBUG: key ", r.dotKeyFile)
-
 	// Servidor DoT si está habilitado
 	if r.enableDoT && r.dotCertFile != "" && r.dotKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(r.dotCertFile, r.dotKeyFile)
@@ -686,4 +682,5 @@ func main() {
 }
 
 // Fin del código
+
 
