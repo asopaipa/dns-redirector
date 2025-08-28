@@ -9,6 +9,7 @@ services:
     volumes:
       - ./ip_blocks.txt:/app/ip_blocks.txt
       - ./config.txt:/app/config.txt
+      - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
     ports:
       - "53:53/udp"
       - "53:53/tcp"
@@ -30,5 +31,6 @@ networks:
   dns_network:
 
     driver: bridge
+
 
 
