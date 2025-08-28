@@ -37,10 +37,9 @@ exec /app/dns-redirector \
   -listen="${LISTEN_ADDR}" \
   -workers="${WORKERS}" \
   -reload-interval="${RELOAD_INTERVAL}" \
-  -enable-dot \
+  -enable-dot="true" \
   -dot-cert="${DOT_CERT}" \
   -dot-key="${DOT_KEY}" \
-  -dot-listen ":853" \
-  -upstream-dot "1.1.1.1:853"
-
+  -dot-listen=":853" \
+  -upstream-dot="1.1.1.1:853" \
   -config="${CONFIG_FILE}"
